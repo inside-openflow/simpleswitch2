@@ -1,2 +1,2 @@
 [Messages Control]
-disable=E1101,C0103
+disable=E1101,C0103,R0913,R0903
