@@ -27,6 +27,7 @@ TODO: Diagram the table structure used here
 
 import logging
 import time
+from . import config
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
@@ -34,26 +35,15 @@ from ryu.controller.handler import set_ev_cls
 from ryu.lib.packet import ethernet, packet
 from ryu.ofproto import ofproto_v1_3
 
-## Config Constants
-SS2_COOKIE = 0x12345678     # A 64-bit cookie to mark our flow entries
-TABLE_ACL = 0
-TABLE_ETH_SRC = 1
-TABLE_ETH_DST = 2
-LEARN_TIMEOUT = 300 # 5 minutes
-PRIORITY_MAX = 1000
-PRIORITY_HIGH = 900
-PRIORITY_MID = 800
-PRIORITY_LOW = 700
-PRIORITY_MIN = 600
-HOST_CACHE_TIMEOUT = 0.5 # seconds
-
 class SS2Core(app_manager.RyuApp):
     "SS2 RyuApp"
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(SS2Core, self).__init__(*args, **kwargs)
-        self.host_cache = HostCache()
+        self.config = config.read_config()
+        self.host_cache = HostCache(self.config.host_cache_timeout)
+
 
     ## Event Handlers
 
@@ -99,12 +89,6 @@ class SS2Core(app_manager.RyuApp):
 
         for msg in msgs:
             dp.send_msg(msg)
-
-    @staticmethod
-    def all_ss2_tables():
-        "Returns a touple of all tables used by SS2Core"
-
-        return (TABLE_ACL, TABLE_ETH_DST, TABLE_ETH_SRC)
 
     @staticmethod
     def apply_actions(dp, actions):
@@ -157,17 +141,26 @@ class SS2Core(app_manager.RyuApp):
 
         return dp.ofproto_parser.OFPBarrierRequest(datapath=dp)
 
-    @staticmethod
-    def flowmod(dp, table_id, command=None, idle_timeout=None,
+
+    ## Instance Helper Methods
+
+    def all_ss2_tables(self):
+        "Returns a touple of all tables used by SS2Core"
+
+        return (self.config.table_acl, self.config.table_eth_src,
+                self.config.table_eth_dst)
+
+    def flowmod(self, dp, table_id, command=None, idle_timeout=None,
                 hard_timeout=None, priority=None, buffer_id=None,
                 out_port=None, out_group=None, flags=None, match=None,
                 instructions=None):
-        "Generate an OFPFlowMod message with the SS2_COOKIE already specified"
+        "Generate an OFPFlowMod message with the cookie already specified"
 
         mod_kwargs = {
             'datapath': dp,
             'table_id': table_id,
-            'command': command or dp.ofproto.OFPFC_ADD
+            'command': command or dp.ofproto.OFPFC_ADD,
+            'cookie': self.config.cookie
         }
         # Selectively add kwargs so ofproto defaults will be used otherwise.
         # Not using **kwargs in method defintion so arguments can be easy to
@@ -191,8 +184,6 @@ class SS2Core(app_manager.RyuApp):
         if instructions != None:
             mod_kwargs['instructions'] = instructions
         return dp.ofproto_parser.OFPFlowMod(**mod_kwargs)
-
-    ## Instance Helper Methods
 
     def flowdel(self, dp, table_id, priority=None, match=None, out_port=None):
         "Generate an OFPFlowMod through flowmod with the OFPFC_DELETE command"
@@ -230,9 +221,9 @@ class SS2Core(app_manager.RyuApp):
     def unlearn_source(self, dp, eth_src):
         "Remove any existing flow entries for this MAC address"
 
-        msgs = [self.flowdel(dp, TABLE_ETH_SRC,
+        msgs = [self.flowdel(dp, self.config.table_eth_src,
                              match=self.match(dp, eth_src=eth_src))]
-        msgs += [self.flowdel(dp, TABLE_ETH_DST,
+        msgs += [self.flowdel(dp, self.config.table_eth_dst,
                               match=self.match(dp, eth_dst=eth_src))]
         msgs += [self.barrier_request(dp)]
         return msgs
@@ -255,17 +246,17 @@ class SS2Core(app_manager.RyuApp):
         instructions = [self.apply_actions(dp, actions)]
         for eth_dst in flood_addrs:
             match = self.match(dp, eth_dst=eth_dst)
-            msgs += [self.flowmod(dp, TABLE_ACL,
+            msgs += [self.flowmod(dp, self.config.table_acl,
                                   match=match,
-                                  priority=PRIORITY_LOW,
+                                  priority=self.config.priority_low,
                                   instructions=instructions)]
 
         # All unicast packets go to table TABLE_ETH_SRC
         match = self.match(dp)
-        instructions = [self.goto_table(dp, TABLE_ETH_SRC)]
-        msgs += [self.flowmod(dp, TABLE_ACL,
+        instructions = [self.goto_table(dp, self.config.table_eth_src)]
+        msgs += [self.flowmod(dp, self.config.table_acl,
                               match=match,
-                              priority=PRIORITY_MIN,
+                              priority=self.config.priority_min,
                               instructions=instructions)]
 
         ## TABLE_ETH_SRC
@@ -275,19 +266,19 @@ class SS2Core(app_manager.RyuApp):
         # prevent a flood event while the controller relearns the address.
         actions = [self.action_output(dp, ofp.OFPP_CONTROLLER, max_len=256)]
         instructions = [self.apply_actions(dp, actions),
-                        self.goto_table(dp, TABLE_ETH_DST)]
-        msgs += [self.flowmod(dp, TABLE_ETH_SRC,
+                        self.goto_table(dp, self.config.table_eth_dst)]
+        msgs += [self.flowmod(dp, self.config.table_eth_src,
                               match=match,
-                              priority=PRIORITY_MIN,
+                              priority=self.config.priority_min,
                               instructions=instructions)]
 
         ## TABLE_ETH_DST
         # Table-miss sends to controller and floods
         actions = [self.action_output(dp, ofp.OFPP_FLOOD)]
         instructions = [self.apply_actions(dp, actions)]
-        msgs += [self.flowmod(dp, TABLE_ETH_DST,
+        msgs += [self.flowmod(dp, self.config.table_eth_dst,
                               match=match,
-                              priority=PRIORITY_MIN,
+                              priority=self.config.priority_min,
                               instructions=instructions)]
         return msgs
 
@@ -295,12 +286,12 @@ class SS2Core(app_manager.RyuApp):
         "Add flow to mark the source learned at a specific port"
 
         match = self.match(dp, eth_src=eth_src, in_port=in_port)
-        instructions = [self.goto_table(dp, TABLE_ETH_DST)]
-        return [self.flowmod(dp, TABLE_ETH_SRC,
-                             hard_timeout=LEARN_TIMEOUT,
+        instructions = [self.goto_table(dp, self.config.table_eth_dst)]
+        return [self.flowmod(dp, self.config.table_eth_src,
+                             hard_timeout=self.config.learn_timeout,
                              match=match,
                              instructions=instructions,
-                             priority=PRIORITY_HIGH)]
+                             priority=self.config.priority_high)]
 
     def add_eth_dst_flow(self, dp, out_port, eth_dst):
         "Add flow to forward packet sent to eth_dst to out_port"
@@ -308,11 +299,11 @@ class SS2Core(app_manager.RyuApp):
         match = self.match(dp, eth_dst=eth_dst)
         actions = [self.action_output(dp, out_port)]
         instructions = [self.apply_actions(dp, actions)]
-        return [self.flowmod(dp, TABLE_ETH_DST,
-                             idle_timeout=LEARN_TIMEOUT,
+        return [self.flowmod(dp, self.config.table_eth_dst,
+                             idle_timeout=self.config.learn_timeout,
                              match=match,
                              instructions=instructions,
-                             priority=PRIORITY_HIGH)]
+                             priority=self.config.priority_high)]
 
 class _HostCacheEntry(object):
     "Basic class to hold data on a cached host"
@@ -327,9 +318,10 @@ class _HostCacheEntry(object):
 class HostCache(object):
     "Keeps track of recently learned hosts to prevent duplicate flowmods"
 
-    def __init__(self):
+    def __init__(self, timeout):
         self.cache = {}
         self.logger = logging.getLogger("SS2HostCache")
+        self.timeout = timeout
 
     def is_new_host(self, dpid, port, mac):
         "Check if the host/port combination is new and add the host entry"
@@ -346,12 +338,12 @@ class HostCache(object):
         return True
 
     def clean_entries(self):
-        "Clean entries older than HOST_CACHE_TIMEOUT"
+        "Clean entries older than self.timeout"
 
         curtime = time.time()
         _cleaned_cache = {}
         for host in self.cache.values():
-            if host.timestamp + HOST_CACHE_TIMEOUT >= curtime:
+            if host.timestamp + self.timeout >= curtime:
                 _cleaned_cache[(host.dpid, host.port, host.mac)] = host
             else:
                 self.logger.debug("Unlearned %s, %s, %s after %s hits",
