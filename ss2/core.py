@@ -25,14 +25,12 @@ SimpleSwitch 2.0 (SS2) Core Controller Application
 TODO: Diagram the table structure used here
 """
 
-import logging
-import time
-from . import config
+from . import config, util
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
-from ryu.lib.packet import ethernet, packet
+from ryu.lib.packet import ethernet, ether_types as ether, packet
 from ryu.ofproto import ofproto_v1_3
 
 class SS2Core(app_manager.RyuApp):
@@ -42,7 +40,7 @@ class SS2Core(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(SS2Core, self).__init__(*args, **kwargs)
         self.config = config.read_config()
-        self.host_cache = HostCache(self.config.host_cache_timeout)
+        self.host_cache = util.HostCache(self.config.host_cache_timeout)
 
 
     ## Event Handlers
@@ -235,26 +233,36 @@ class SS2Core(app_manager.RyuApp):
 
         msgs = []
         ## TABLE_ACL
-        # Flood multicast
-        flood_addrs = [
-            ('01:80:c2:00:00:00', '01:80:c2:00:00:00'), # LLDP, other 802.x
-            ('01:00:5e:00:00:00', 'ff:ff:ff:00:00:00'), # IPv4 multicast
-            ('33:33:00:00:00:00', 'ff:ff:00:00:00:00'), # IPv6 multicast
-            ('ff:ff:ff:ff:ff:ff', None) # Ethernet broadcast
-        ]
-        actions = [self.action_output(dp, ofp.OFPP_FLOOD)]
-        instructions = [self.apply_actions(dp, actions)]
-        for eth_dst in flood_addrs:
-            match = self.match(dp, eth_dst=eth_dst)
-            msgs += [self.flowmod(dp, self.config.table_acl,
-                                  match=match,
-                                  priority=self.config.priority_low,
-                                  instructions=instructions)]
+        # Add a low priority table-miss flow to forward to the switch table.
+        # Other modules can add higher priority flows as needed.
+        instructions = [self.goto_table(dp, self.config.table_l2_switch)]
+        msgs += [self.flowmod(dp, self.config.table_acl,
+                              match=self.match(dp),
+                              priority=self.config.priority_low,
+                              instructions=instructions)]
 
-        # All unicast packets go to table TABLE_ETH_SRC
+        ## TABLE_L2_SWITCH
+        # Drop certain packets that should not be broadcast or processed
+        # (Mimic Faucet)
+
+        def _drop(match):
+            return [self.flowmod(dp, self.config.table_l2_switch,
+                                 match=match, instructions=[])]
+
+        # Drop LLDP
+        msgs += _drop(self.match(dp, eth_type=ether.ETH_TYPE_LLDP))
+
+        # Drop STDP BPDU
+        msgs += _drop(self.match(dp, eth_dst='01:80:c2:00:00:00'))
+        msgs += _drop(self.match(dp, eth_dst='01:00:0c:cc:cc:cd'))
+
+        # Drop Broadcast Sources
+        msgs += _drop(self.match(dp, eth_src='ff:ff:ff:ff:ff:ff'))
+
+        # All other packets go to table TABLE_ETH_SRC
         match = self.match(dp)
         instructions = [self.goto_table(dp, self.config.table_eth_src)]
-        msgs += [self.flowmod(dp, self.config.table_acl,
+        msgs += [self.flowmod(dp, self.config.table_l2_switch,
                               match=match,
                               priority=self.config.priority_min,
                               instructions=instructions)]
@@ -273,7 +281,23 @@ class SS2Core(app_manager.RyuApp):
                               instructions=instructions)]
 
         ## TABLE_ETH_DST
-        # Table-miss sends to controller and floods
+        # Flood multicast (Mimic Faucet)
+        flood_addrs = [
+            ('01:80:c2:00:00:00', '01:80:c2:00:00:00'), # 802.x
+            ('01:00:5e:00:00:00', 'ff:ff:ff:00:00:00'), # IPv4 multicast
+            ('33:33:00:00:00:00', 'ff:ff:00:00:00:00'), # IPv6 multicast
+            ('ff:ff:ff:ff:ff:ff', None) # Ethernet broadcast
+        ]
+        actions = [self.action_output(dp, ofp.OFPP_FLOOD)]
+        instructions = [self.apply_actions(dp, actions)]
+        for eth_dst in flood_addrs:
+            match = self.match(dp, eth_dst=eth_dst)
+            msgs += [self.flowmod(dp, self.config.table_eth_dst,
+                                  match=match,
+                                  priority=self.config.priority_max,
+                                  instructions=instructions)]
+
+        # Table-miss floods
         actions = [self.action_output(dp, ofp.OFPP_FLOOD)]
         instructions = [self.apply_actions(dp, actions)]
         msgs += [self.flowmod(dp, self.config.table_eth_dst,
@@ -304,49 +328,3 @@ class SS2Core(app_manager.RyuApp):
                              match=match,
                              instructions=instructions,
                              priority=self.config.priority_high)]
-
-class _HostCacheEntry(object):
-    "Basic class to hold data on a cached host"
-
-    def __init__(self, dpid, port, mac):
-        self.dpid = dpid
-        self.port = port
-        self.mac = mac
-        self.timestamp = time.time()
-        self.counter = 0
-
-class HostCache(object):
-    "Keeps track of recently learned hosts to prevent duplicate flowmods"
-
-    def __init__(self, timeout):
-        self.cache = {}
-        self.logger = logging.getLogger("SS2HostCache")
-        self.timeout = timeout
-
-    def is_new_host(self, dpid, port, mac):
-        "Check if the host/port combination is new and add the host entry"
-
-        self.clean_entries()
-        entry = self.cache.get((dpid, port, mac), None)
-        if entry != None:
-            entry.counter += 1
-            return False
-
-        entry = _HostCacheEntry(dpid, port, mac)
-        self.cache[(dpid, port, mac)] = entry
-        self.logger.debug("Learned %s, %s, %s", dpid, port, mac)
-        return True
-
-    def clean_entries(self):
-        "Clean entries older than self.timeout"
-
-        curtime = time.time()
-        _cleaned_cache = {}
-        for host in self.cache.values():
-            if host.timestamp + self.timeout >= curtime:
-                _cleaned_cache[(host.dpid, host.port, host.mac)] = host
-            else:
-                self.logger.debug("Unlearned %s, %s, %s after %s hits",
-                                  host.dpid, host.port, host.mac, host.counter)
-
-        self.cache = _cleaned_cache
