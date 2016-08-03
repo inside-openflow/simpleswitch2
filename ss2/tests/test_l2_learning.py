@@ -29,6 +29,8 @@ from mininet.clean import cleanup
 from mininet.topo import SingleSwitchTopo
 from mininet.topolib import TreeTopo
 
+# pylint: disable=C0111,R0201
+
 def setUpModule():
     cleanup()
 
@@ -67,7 +69,6 @@ class LearningTreeTestCase(SimpleTopoTestCase):
         h1.deleteIntfs()
         link = self.net.addLink(s3, h1, addr2="00:00:00:00:00:01")
         link.intf2.config(ip="10.0.0.1/8")
-        print(repr(s3.intfs))
         s3.attach(link.intf1)
 
         # run ping again
@@ -92,7 +93,6 @@ class LearningSingleTestCase(SimpleTopoTestCase):
         h1.deleteIntfs()
         link = self.net.addLink(s1, h1, addr2="00:00:00:00:00:01")
         link.intf2.config(ip="10.0.0.1/8")
-        print(repr(s1.intfs))
         s1.attach(link.intf1)
 
         # run ping again
