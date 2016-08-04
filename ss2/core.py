@@ -50,8 +50,7 @@ class SS2Core(app_manager.RyuApp, SS2App):
     def switch_features_handler(self, ev):
         "Handle new datapaths attaching to Ryu"
 
-        msgs = []
-        msgs.extend(self.add_datapath(ev.msg.datapath))
+        msgs = self.add_datapath(ev.msg.datapath)
 
         self.send_msgs(ev.msg.datapath, msgs)
 
@@ -71,11 +70,10 @@ class SS2Core(app_manager.RyuApp, SS2App):
         if not self.host_cache.is_new_host(dp.id, in_port, eth.src):
             return
 
-        msgs = []
-        msgs.extend(self.learn_source(
+        msgs = self.learn_source(
             dp=dp,
             port=in_port,
-            eth_src=eth.src))
+            eth_src=eth.src)
 
         self.send_msgs(dp, msgs)
 
@@ -126,6 +124,7 @@ class SS2Core(app_manager.RyuApp, SS2App):
         # (Mimic Faucet)
 
         def _drop(match):
+            "Helper to create a drop flow entry for table_l2_switch"
             return [self.flowmod(dp, self.config.table_l2_switch,
                                  match=match, instructions=[])]
 
