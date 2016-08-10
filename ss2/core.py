@@ -126,7 +126,8 @@ class SS2Core(app_manager.RyuApp, SS2App):
         def _drop(match):
             "Helper to create a drop flow entry for table_l2_switch"
             return [self.flowmod(dp, self.config.table_l2_switch,
-                                 match=match, instructions=[])]
+                                 match=match, priority=self.config.priority_max,
+                                 instructions=[])]
 
         # Drop LLDP
         msgs += _drop(self.match(dp, eth_type=ether.ETH_TYPE_LLDP))
@@ -177,6 +178,7 @@ class SS2Core(app_manager.RyuApp, SS2App):
                                   instructions=instructions)]
 
         # Table-miss floods
+        match = self.match(dp)
         actions = [self.action_output(dp, ofp.OFPP_FLOOD)]
         instructions = [self.apply_actions(dp, actions)]
         msgs += [self.flowmod(dp, self.config.table_eth_dst,
